@@ -40,6 +40,8 @@ class TargetImageDataset(Dataset):
         image = self.image_pose[index]
         data = cv2.imread(self.source_path / image["file_name"], cv2.IMREAD_COLOR)
 
+        print(index, image["file_name"])
+
         return ImageData(
             data=data
         ), ImagePose(
@@ -47,20 +49,24 @@ class TargetImageDataset(Dataset):
             height=image["height"],
             f=image["f"],
             k=image["k"],
-            tvec=image["tvec"],
+            tvec=np.array(image["tvec"]),
             qvec=np.quaternion(*image["qvec"]),
         )
     
 
 class NeuralSurfaceReconstruction():
-    def __init__(self, *, img: Path, img_pose: Path, fg_v_sdf: Path, bg_v_sdf: Path):
-        self.images = TargetImageDataset(img, img_pose)
-        self.fg_V_sdf = torch.load(fg_v_sdf, weights_only=True)
-        self.bg_V_sdf = torch.load(bg_v_sdf, weights_only=True)
+    def __init__(self, *, data: Path):
+        self.images = TargetImageDataset(data / "raw_images", data / "preprocessed/image_pose.json")
+        self.fg_V_sdf = torch.load(data / "preprocessed/initial_v_sdf_fg.pt", weights_only=True)
+        self.bg_V_sdf = torch.load(data / "preprocessed/initial_v_sdf_bg.pt", weights_only=True)
         self.fg_V_feat = self.fg_V_sdf.repeat(1, 3, 1, 1, 1)  # R,G,B
         self.bg_V_feat = self.bg_V_sdf.repeat(1, 3, 1, 1, 1)  # R,G,B
         self.fg_V_feat[:] = 0.5
         self.bg_V_feat[:] = 0.5
+        with open(data / "preprocessed/initial_v_sdf_fg.npy", "rb") as fobj:
+            self.fg_V_sdf_grid = np.load(fobj)
+        with open(data / "preprocessed/initial_v_sdf_bg.npy", "rb") as fobj:
+            self.bg_V_sdf_grid = np.load(fobj)
 
     def query_pixel_sample_points(self, index: int, *,
                                   N_query_points: int,
@@ -76,7 +82,7 @@ class NeuralSurfaceReconstruction():
         """
         data, pose = self.images[index]
 
-        rot_mat = quaternion.as_rotation_matrix(pose.qvec)   # 3x3 rot mat
+        rot_mat = quaternion.as_rotation_matrix(pose.qvec).T   # 3x3 rot mat
 
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/sensor/models.h#L715
@@ -125,7 +131,8 @@ class NeuralSurfaceReconstruction():
         sp = np.array([spx, spy, spz])  # 3xTxN
         st = np.transpose(sp, (2, 1, 0))  # NxTx3
 
-        st = st+pose.tvec
+        # https://github.com/colmap/colmap/blob/main/src/colmap/geometry/rigid3.h#L72
+        st = st+np.einsum("ij,j->i", rot_mat, -pose.tvec)
 
         return (target_pixels, st)
 
