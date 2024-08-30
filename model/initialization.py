@@ -64,7 +64,10 @@ class NeuralSurfaceReconstruction():
 
     def query_pixel_sample_points(self, index: int, *,
                                   N_query_points: int,
-                                  t_size: float
+                                  t_size: float,
+                                  _pixel_grid_width_step = 1.0,
+                                  _pixel_grid_height_step = 1.0,
+                                  _scale = 1.0,
                                   ) -> tuple[np.ndarray, np.ndarray]:
         """
         returns:
@@ -80,11 +83,15 @@ class NeuralSurfaceReconstruction():
         # https://calib.io/blogs/knowledge-base/camera-models?srsltid=AfmBOoosTUXUe3QZqSrWoJXC9Yr04axC6Mvx7ru4xjo-yHMRf4H_erhx
 
         # initial point grid from image information
-        px, py = np.mgrid[-pose.width/2:pose.width/2:1.0, -pose.height/2:pose.height/2:1.0]
+        px, py = np.mgrid[-pose.width/2:pose.width/2:_pixel_grid_width_step,
+                          -pose.height/2:pose.height/2:_pixel_grid_height_step]
         pz = np.full(px.shape, 1.0)
 
         #### FOCAL LENGTH NORMALIZATION (f)
-        img_points = np.dstack([(px.flatten()+0.5)/pose.f, (py.flatten()+0.5)/pose.f, pz.flatten()])[0]  # Nx2 points to be rot'd at origin
+        pose.f *= _scale
+        img_points = np.dstack([(px.flatten()+0.5)/pose.f,
+                                (py.flatten()+0.5)/pose.f,
+                                pz.flatten()])[0]  # Nx2 points to be rot'd at origin
 
         ##### DISTORTION (k)
         distortion = pose.k*(img_points[:,0]**2+img_points[:,1]**2)
@@ -117,6 +124,8 @@ class NeuralSurfaceReconstruction():
 
         sp = np.array([spx, spy, spz])  # 3xTxN
         st = np.transpose(sp, (2, 1, 0))  # NxTx3
+
+        st = st+pose.tvec
 
         return (target_pixels, st)
 
