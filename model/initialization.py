@@ -1,5 +1,6 @@
 from torch import nn
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 import json
 import os
@@ -38,6 +39,8 @@ class VoxelSector:  # background / foreground
     grid_pos: np.ndarray
     step_size: float = field(init=False)
     voxel_pos: np.ndarray = field(init=False)
+    center: np.ndarray = field(init=False)
+    scale: np.ndarray = field(init=False)
     # grid data
     sdf: torch.Tensor
     feat: torch.Tensor = field(init=False)
@@ -58,7 +61,18 @@ class VoxelSector:  # background / foreground
             self.grid_pos[0, :, 0, 0],
             self.grid_pos[1, 0, :, 0],
             self.grid_pos[2, 0, 0, :],
-        ])
+        ], dtype=np.float32)
+
+        self.center = np.array([
+            (self.grid_pos[0, :, 0, 0].max()+self.grid_pos[0, :, 0, 0].min())/2,
+            (self.grid_pos[1, 0, :, 0].max()+self.grid_pos[1, 0, :, 0].min())/2,
+            (self.grid_pos[2, 0, 0, :].max()+self.grid_pos[2, 0, 0, :].min())/2,
+        ], dtype=np.float32)
+        self.scale = np.array([
+            (self.grid_pos[0, :, 0, 0].max()-self.grid_pos[0, :, 0, 0].min())/2,
+            (self.grid_pos[1, 0, :, 0].max()-self.grid_pos[1, 0, :, 0].min())/2,
+            (self.grid_pos[2, 0, 0, :].max()-self.grid_pos[2, 0, 0, :].min())/2,
+        ], dtype=np.float32)
 
 
 
@@ -99,6 +113,8 @@ class NeuralSurfaceReconstructor(nn.Module):
     """
 
     def __init__(self, fg_V: VoxelSector, bg_V: VoxelSector, radiance_mlp_size: int):
+        super().__init__()
+
         self.fg_V = fg_V
         self.bg_V = bg_V
 
@@ -109,6 +125,7 @@ class NeuralSurfaceReconstructor(nn.Module):
         self.radiance_mlp_in = nn.Linear(in_features=3, out_features=radiance_mlp_size)
         self.radiance_mlp_out = nn.Linear(in_features=radiance_mlp_size, out_features=3)
 
+    @torch.no_grad
     def sector(self, x_i: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         returns: (is foreground, is background) both are mutually exclusive
@@ -116,28 +133,46 @@ class NeuralSurfaceReconstructor(nn.Module):
 
         ft = ((self.fg_V.min_x < x_i[:, 0]) & (x_i[:, 0] < self.fg_V.max_x) &
               (self.fg_V.min_y < x_i[:, 1]) & (x_i[:, 1] < self.fg_V.max_y) &
-              (self.fg_V.min_z < x_i[:, 2]) & (x_i[:, 2] < self.fg_V.max_z)).astype(int)
+              (self.fg_V.min_z < x_i[:, 2]) & (x_i[:, 2] < self.fg_V.max_z))
+        # background filter should have a larger bbox
         bt = ((self.bg_V.min_x < x_i[:, 0]) & (x_i[:, 0] < self.bg_V.max_x) &
               (self.bg_V.min_y < x_i[:, 1]) & (x_i[:, 1] < self.bg_V.max_y) &
-              (self.bg_V.min_z < x_i[:, 2]) & (x_i[:, 2] < self.bg_V.max_z)).astype(int)
+              (self.bg_V.min_z < x_i[:, 2]) & (x_i[:, 2] < self.bg_V.max_z))
 
-        return (ft, bt*(1-ft))
+        return (ft, bt & ~ft)
 
 
     def S(self, x_i: torch.Tensor) -> torch.Tensor:
         """
         x_i: a simple list of 3-D x-points in the current t_i
         """
-        is_fg, is_bg = self.sector(x_i)
-        fx_i, bx_i = x_i*is_fg[:, np.newaxis], x_i*is_bg[:, np.newaxis]
+        is_f, is_b = self.sector(x_i)
 
-        fx_i = np.floor((x_i-self.fg_V.voxel_pos[:, 0])/self.fg_V.step_size)*self.fg_V.step_size+self.fg_V.voxel_pos[:, 0]
-        bx_i = np.floor((x_i-self.bg_V.voxel_pos[:, 0])/self.bg_V.step_size)*self.bg_V.step_size+self.bg_V.voxel_pos[:, 0]
+        norm_fx_i = ((x_i[is_f]-self.fg_V.center)/self.fg_V.scale).float()
+        norm_fx_i = torch.flip(  # X Y Z -> Z Y X
+            norm_fx_i[torch.newaxis, torch.newaxis, torch.newaxis],
+            dims=[-1]
+        )
+        f_sdf_i = F.grid_sample(
+            self.fg_V.sdf, norm_fx_i,
+            mode="bilinear", padding_mode="border", align_corners=True
+        ).flatten()
 
-        fv_i_000 = np.abs(fx_i[:, :, np.newaxis]-self.fg_V.voxel_pos).argmin(axis=2)
-        bv_i_000 = np.abs(bx_i[:, :, np.newaxis]-self.bg_V.voxel_pos).argmin(axis=2)
+        norm_bx_i = ((x_i[is_b]-self.bg_V.center)/self.bg_V.scale).float()
+        norm_bx_i = torch.flip(  # X Y Z -> Z Y X
+            norm_bx_i[torch.newaxis, torch.newaxis, torch.newaxis],
+            dims=[-1]
+        )
+        b_sdf_i = F.grid_sample(
+            self.bg_V.sdf, norm_bx_i,
+            mode="bilinear", padding_mode="border", align_corners=True
+        ).flatten()
 
-        # np.clip(v000+[1, 0, 0], a_min=None, a_max=15)
+        sdf = torch.full(x_i.shape[:1], 1.0)
+        sdf[is_f] = f_sdf_i
+        sdf[is_b] = b_sdf_i
+
+        return sdf
 
 
     def L_o(self, x_i: torch.Tensor, v: torch.Tensor):
@@ -176,6 +211,8 @@ class NeuralSurfaceReconstruction:
             grid_pos=np.load(data / "preprocessed/initial_v_sdf_bg.npy"),
             sdf=torch.load(data / "preprocessed/initial_v_sdf_bg.pt", weights_only=True),
         )
+
+        self.model = NeuralSurfaceReconstructor(self.fg_V, self.bg_V, 64)
 
     def query_pixel_sample_points(
             self, index: int, *, N_query_points: int, t_size: float,
