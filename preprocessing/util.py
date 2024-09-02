@@ -81,6 +81,7 @@ def sdf_points_voxelization(
     min_x, max_x,
     min_y, max_y,
     min_z, max_z,
+    rate: float,
     FLOAT_TOLERANCE: float = 1e-5,
 ) -> tuple[np.ndarray, torch.Tensor]:
 
@@ -111,9 +112,8 @@ def sdf_points_voxelization(
         vz = np.where(np.isclose(vsdf_grid[2, 0, 0, :], pz, FLOAT_TOLERANCE))[0][0]
 
         # print("GRID: ", vx, vy, vz)
-        if V_sdf[0][0][vx, vy, vz] > -1-(-0.01):
-            V_sdf[0][0][vx, vy, vz] += -0.01
-
+        if V_sdf[0][0][vx, vy, vz] > -1:
+            V_sdf[0][0][vx, vy, vz] += rate
 
 
     return vsdf_grid, V_sdf

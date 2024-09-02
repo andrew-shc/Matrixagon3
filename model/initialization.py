@@ -1,8 +1,9 @@
+from torch import nn
 import torch
 from torch.utils.data import Dataset
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 from pathlib import Path
 import cv2
@@ -24,6 +25,41 @@ class ImagePose:
     tvec: float
     qvec: float
 
+@dataclass
+class VoxelSector:  # background / foreground
+    # bounding box
+    min_x: float = field(init=False)
+    max_x: float = field(init=False)
+    min_y: float = field(init=False)
+    max_y: float = field(init=False)
+    min_z: float = field(init=False)
+    max_z: float = field(init=False)
+    # grid positioning
+    grid_pos: np.ndarray
+    step_size: float = field(init=False)
+    voxel_pos: np.ndarray = field(init=False)
+    # grid data
+    sdf: torch.Tensor
+    feat: torch.Tensor = field(init=False)
+
+    def __post_init__(self):
+        self.min_x = self.grid_pos[0].min()
+        self.max_x = self.grid_pos[0].max()
+        self.min_y = self.grid_pos[1].min()
+        self.max_y = self.grid_pos[1].max()
+        self.min_z = self.grid_pos[2].min()
+        self.max_z = self.grid_pos[2].max()
+
+        self.feat = self.sdf.repeat(1, 3, 1, 1, 1)   # R,G,B
+        self.feat[:] = 0.5
+
+        self.step_size = self.grid_pos[0][0][0][0]-self.grid_pos[0][1][0][0]        
+        self.voxel_pos = np.array([
+            self.grid_pos[0, :, 0, 0],
+            self.grid_pos[1, 0, :, 0],
+            self.grid_pos[2, 0, 0, :],
+        ])
+
 
 
 class TargetImageDataset(Dataset):
@@ -40,7 +76,7 @@ class TargetImageDataset(Dataset):
         image = self.image_pose[index]
         data = cv2.imread(self.source_path / image["file_name"], cv2.IMREAD_COLOR)
 
-        print(index, image["file_name"])
+        # print(index, image["file_name"])
 
         return ImageData(
             data=data
@@ -54,31 +90,102 @@ class TargetImageDataset(Dataset):
         )
     
 
-class NeuralSurfaceReconstruction():
-    def __init__(self, *, data: Path):
-        self.images = TargetImageDataset(data / "raw_images", data / "preprocessed/image_pose.json")
-        self.fg_V_sdf = torch.load(data / "preprocessed/initial_v_sdf_fg.pt", weights_only=True)
-        self.bg_V_sdf = torch.load(data / "preprocessed/initial_v_sdf_bg.pt", weights_only=True)
-        self.fg_V_feat = self.fg_V_sdf.repeat(1, 3, 1, 1, 1)  # R,G,B
-        self.bg_V_feat = self.bg_V_sdf.repeat(1, 3, 1, 1, 1)  # R,G,B
-        self.fg_V_feat[:] = 0.5
-        self.bg_V_feat[:] = 0.5
-        with open(data / "preprocessed/initial_v_sdf_fg.npy", "rb") as fobj:
-            self.fg_V_sdf_grid = np.load(fobj)
-        with open(data / "preprocessed/initial_v_sdf_bg.npy", "rb") as fobj:
-            self.bg_V_sdf_grid = np.load(fobj)
+class NeuralSurfaceReconstructor(nn.Module):
+    """ (I)
+    Parameters:
+    - Foreground/background voxel SDFs
+    - Foreground/background voxel feats
+    - 1 hidden layer MLP w/ ReLU
+    """
 
-    def query_pixel_sample_points(self, index: int, *,
-                                  N_query_points: int,
-                                  t_size: float,
-                                  _pixel_grid_width_step = 1.0,
-                                  _pixel_grid_height_step = 1.0,
-                                  _scale = 1.0,
-                                  ) -> tuple[np.ndarray, np.ndarray]:
+    def __init__(self, fg_V: VoxelSector, bg_V: VoxelSector, radiance_mlp_size: int):
+        self.fg_V = fg_V
+        self.bg_V = bg_V
+
+        self.fg_sdf = nn.Parameter(self.fg_V.sdf)
+        self.fg_feat = nn.Parameter(self.fg_V.feat)
+        self.bg_sdf = nn.Parameter(self.bg_V.sdf)
+        self.bg_feat = nn.Parameter(self.bg_V.feat)
+        self.radiance_mlp_in = nn.Linear(in_features=3, out_features=radiance_mlp_size)
+        self.radiance_mlp_out = nn.Linear(in_features=radiance_mlp_size, out_features=3)
+
+    def sector(self, x_i: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        returns: (is foreground, is background) both are mutually exclusive
+        """
+
+        ft = ((self.fg_V.min_x < x_i[:, 0]) & (x_i[:, 0] < self.fg_V.max_x) &
+              (self.fg_V.min_y < x_i[:, 1]) & (x_i[:, 1] < self.fg_V.max_y) &
+              (self.fg_V.min_z < x_i[:, 2]) & (x_i[:, 2] < self.fg_V.max_z)).astype(int)
+        bt = ((self.bg_V.min_x < x_i[:, 0]) & (x_i[:, 0] < self.bg_V.max_x) &
+              (self.bg_V.min_y < x_i[:, 1]) & (x_i[:, 1] < self.bg_V.max_y) &
+              (self.bg_V.min_z < x_i[:, 2]) & (x_i[:, 2] < self.bg_V.max_z)).astype(int)
+
+        return (ft, bt*(1-ft))
+
+
+    def S(self, x_i: torch.Tensor) -> torch.Tensor:
+        """
+        x_i: a simple list of 3-D x-points in the current t_i
+        """
+        is_fg, is_bg = self.sector(x_i)
+        fx_i, bx_i = x_i*is_fg[:, np.newaxis], x_i*is_bg[:, np.newaxis]
+
+        fx_i = np.floor((x_i-self.fg_V.voxel_pos[:, 0])/self.fg_V.step_size)*self.fg_V.step_size+self.fg_V.voxel_pos[:, 0]
+        bx_i = np.floor((x_i-self.bg_V.voxel_pos[:, 0])/self.bg_V.step_size)*self.bg_V.step_size+self.bg_V.voxel_pos[:, 0]
+
+        fv_i_000 = np.abs(fx_i[:, :, np.newaxis]-self.fg_V.voxel_pos).argmin(axis=2)
+        bv_i_000 = np.abs(bx_i[:, :, np.newaxis]-self.bg_V.voxel_pos).argmin(axis=2)
+
+        # np.clip(v000+[1, 0, 0], a_min=None, a_max=15)
+
+
+    def L_o(self, x_i: torch.Tensor, v: torch.Tensor):
+        pass
+
+    def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        ray queried position, ray direction S^2 => rendered images
+        """
+        N = 50
+
+        C_img = torch.Tensor()
+        T_i = torch.Tensor()  # start with 1
+        for i in range(N):
+            α_i = torch.max(
+                0,
+                (
+                    torch.sigmoid(self.S(x[:, i  ]))-
+                    torch.sigmoid(self.S(x[:, i+1]))
+                )/torch.sigmoid(self.S(x[:, i]))
+            )
+            C_img += T_i*α_i*self.L_o(x[:, i], -v)
+            T_i *= (1-α_i)
+
+
+
+class NeuralSurfaceReconstruction:
+    def __init__(self, *, data: Path):
+        self.images = TargetImageDataset(data / "raw_images",
+                                         data / "preprocessed/image_pose.json")
+        self.fg_V = VoxelSector(
+            grid_pos=np.load(data / "preprocessed/initial_v_sdf_fg.npy"),
+            sdf=torch.load(data / "preprocessed/initial_v_sdf_fg.pt", weights_only=True),
+        )
+        self.bg_V = VoxelSector(
+            grid_pos=np.load(data / "preprocessed/initial_v_sdf_bg.npy"),
+            sdf=torch.load(data / "preprocessed/initial_v_sdf_bg.pt", weights_only=True),
+        )
+
+    def query_pixel_sample_points(
+            self, index: int, *, N_query_points: int, t_size: float,
+            _pixel_grid_width_step = 1.0, _pixel_grid_height_step = 1.0, _scale = 1.0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         returns:
         1. Nx3 array of target image's pixels (normalized RGB)
         2. NxTx3 array of the pixels' corresponding sample query points in coordinates
+        3. Nx2 array of each pixel's ray direction in S^2 unit sphere
         """
         data, pose = self.images[index]
 
@@ -93,7 +200,7 @@ class NeuralSurfaceReconstruction():
                           -pose.height/2:pose.height/2:_pixel_grid_height_step]
         pz = np.full(px.shape, 1.0)
 
-        #### FOCAL LENGTH NORMALIZATION (f)
+        ##### FOCAL LENGTH NORMALIZATION (f)
         pose.f *= _scale
         img_points = np.dstack([(px.flatten()+0.5)/pose.f,
                                 (py.flatten()+0.5)/pose.f,
@@ -135,6 +242,23 @@ class NeuralSurfaceReconstruction():
         st = st+np.einsum("ij,j->i", rot_mat, -pose.tvec)
 
         return (target_pixels, st)
+    
+    @staticmethod
+    def S(x: np.ndarray, v_sdf: np.ndarray):
+        pass
+
+    @staticmethod
+    def L_o(x: np.ndarray, v: np.ndarray, v_feat: np.ndarray):
+        """
+        For sake of implementation: v must be represented in S^2 unit sphere (theta and phi)
+        """
+        pass
+
+    def render_color(self, query_points: np.ndarray):
+        pass
+
+    def train(self):
+        loss = 0
 
 
     
