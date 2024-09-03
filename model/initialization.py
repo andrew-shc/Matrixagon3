@@ -10,6 +10,8 @@ from pathlib import Path
 import cv2
 import quaternion
 
+import gc
+
 
 
 
@@ -91,7 +93,7 @@ class TargetImageDataset(Dataset):
             height=image["height"],
             f=image["f"],
             k=image["k"],
-            tvec=np.array(image["tvec"]),
+            tvec=np.array(image["tvec"]).astype(np.float32),
             qvec=np.quaternion(*image["qvec"]),
         )
     
@@ -223,7 +225,7 @@ class NeuralSurfaceReconstructor(nn.Module):
 
     def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
-        ray queried position, ray direction S^2 => rendered images
+        ray queried position, ray direction S^2 => rendered image
         """
         N = 50
 
@@ -257,7 +259,7 @@ class NeuralSurfaceReconstruction:
 
         self.model = NeuralSurfaceReconstructor(self.fg_V, self.bg_V, 64)
 
-    def query_points_and_direction(
+    def query_data(
             self, index: int, *, N_query_points: int, t_size: float,
             _pixel_grid_width_step = 1.0, _pixel_grid_height_step = 1.0, _scale = 1.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -269,7 +271,13 @@ class NeuralSurfaceReconstruction:
         """
         data, pose = self.images[index]
 
-        rot_mat = quaternion.as_rotation_matrix(pose.qvec).T   # 3x3 rot mat
+        target_pixels = data.data.astype(np.float32)/255
+
+        del data.data
+        del data
+        gc.collect()
+
+        rot_mat = quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)   # 3x3 rot mat
 
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/sensor/models.h#L715
@@ -278,60 +286,60 @@ class NeuralSurfaceReconstruction:
         # initial point grid from image information
         px, py = np.mgrid[-pose.width/2:pose.width/2:_pixel_grid_width_step,
                           -pose.height/2:pose.height/2:_pixel_grid_height_step]
-        pz = np.full(px.shape, 1.0)
+        px, py = np.float32(px), np.float32(py)
 
         ##### FOCAL LENGTH NORMALIZATION (f)
         pose.f *= _scale
-        img_points = np.dstack([(px.flatten()+0.5)/pose.f,
-                                (py.flatten()+0.5)/pose.f,
-                                pz.flatten()])[0]  # Nx2 points to be rot'd at origin
+        nx = (px.flatten()+0.5)/pose.f
+        ny = (py.flatten()+0.5)/pose.f
+
+        del px, py
+        gc.collect()
 
         ##### DISTORTION (k)
-        distortion = pose.k*(img_points[:,0]**2+img_points[:,1]**2)
+        distortion = pose.k*(nx**2+ny**2)
 
-        dx = img_points[:,0]*(1+distortion)
-        dy = img_points[:,1]*(1+distortion)
-        dz = img_points[:,2]
-        distorted_img_points = np.dstack([dx, dy, dz])[0]
+        distorted_img_points = np.dstack([
+            nx*(1+distortion),
+            ny*(1+distortion),
+            np.full(nx.shape, 1.0, dtype=np.float32),  # z
+        ])[0]
 
-        ##### ROTATION (qvec)
-        rotated_img_points = np.einsum("ij,nj->ni", rot_mat, distorted_img_points)
+        del nx,ny,distortion
+        gc.collect()
 
-        rpx, rpy, rpz = np.split(rotated_img_points, 3, axis=1)
-        rpx, rpy, rpz = rpx.flatten(), rpy.flatten(), rpz.flatten()
+        ##### DISTORTION (k) & sampling query points
+        t = 1.0+t_size + np.arange(0, N_query_points, dtype=np.float32)*t_size
+        expand = lambda p: np.repeat(p[:, np.newaxis], N_query_points, axis=1)
 
-        # sampling query points
-        t = np.expand_dims(1.0+t_size + np.arange(0, N_query_points)*t_size, axis=1)
-        expand = lambda p: np.repeat(np.expand_dims(p, axis=0), N_query_points, axis=0)
+        sto = t[np.newaxis, :, np.newaxis]*expand(
+            np.einsum("ij,nj->ni", rot_mat, distorted_img_points).astype(np.float32)  # rotation
+        )  # 1xTx1 , NxTx3  =>  NxTx3
 
-        spx = t*expand(rpx)
-        spy = t*expand(rpy)
-        spz = t*expand(rpz)
-
-        imx = (px.flatten()+pose.width/2).astype(int)
-        imy = (py.flatten()+pose.height/2).astype(int)
-        target_pixels = data.data[imy, imx].astype(float)/255
-
-        # path of x_i points for one viewing direction
-        np.dstack([spx[:, 0], spy[:, 0], spz[:, 0]])
-
-        sp = np.array([spx, spy, spz])  # 3xTxN
-        sto = np.transpose(sp, (2, 1, 0))  # NxTx3
+        del t, distorted_img_points
+        gc.collect()
 
         # https://en.wikipedia.org/wiki/Spherical_coordinate_system
         # theta: inclination (0-180deg), 0deg = +Y; 180deg = -Y
         # phi: azimuth (0-360deg), 0deg = +X 0Z; 90deg = 0X +Z; 180deg = -X 0Z
         sto_0 = sto[:, 0]
-        theta = np.arccos(sto_0[:,1] / np.linalg.norm(sto_0, axis=1))  #*(180.0/np.pi)
-        phi = np.sign(sto_0[:,2])*np.arccos(sto_0[:,0] / np.linalg.norm(sto_0[:, [0,2]], axis=1))  #*(180.0/np.pi)
-        v = np.stack([theta, phi], axis=0)
+        
+        v = np.stack([
+            # THETA
+            np.arccos(sto_0[:,1] / np.linalg.norm(sto_0, axis=1)),  #*(180.0/np.pi)
+            # PHI
+            np.sign(sto_0[:,2])*np.arccos(sto_0[:,0] / np.linalg.norm(sto_0[:, [0,2]], axis=1)),   #*(180.0/np.pi)
+        ], axis=0)
+
+        del sto_0  #, theta, phi
+        gc.collect()
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/geometry/rigid3.h#L72
         st = sto+np.einsum("ij,j->i", rot_mat, -pose.tvec)
 
-        return (torch.from_numpy(target_pixels).float(),
-                torch.from_numpy(st).float(),
-                torch.from_numpy(v).float())
+        return (torch.from_numpy(target_pixels),
+                torch.from_numpy(st),
+                torch.from_numpy(v))
 
     def train(self):
         loss = 0
