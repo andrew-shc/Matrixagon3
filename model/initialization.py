@@ -17,7 +17,7 @@ import gc
 
 @dataclass
 class ImageData:
-    data: np.ndarray
+    data: torch.Tensor
 
 @dataclass
 class ImagePose:
@@ -25,8 +25,8 @@ class ImagePose:
     height: int
     f: float
     k: float
-    tvec: float
-    qvec: float
+    tvec: torch.Tensor
+    qvec: np.quaternion
 
 @dataclass
 class VoxelSector:  # background / foreground
@@ -87,13 +87,13 @@ class TargetImageDataset(Dataset):
         # print(index, image["file_name"])
 
         return ImageData(
-            data=data
+            data=torch.from_numpy(data).half()/255
         ), ImagePose(
             width=image["width"],
             height=image["height"],
             f=image["f"],
             k=image["k"],
-            tvec=np.array(image["tvec"]).astype(np.float32),
+            tvec=torch.Tensor(image["tvec"]),
             qvec=np.quaternion(*image["qvec"]),
         )
     
@@ -262,7 +262,7 @@ class NeuralSurfaceReconstruction:
     def query_data(
             self, index: int, *, N_query_points: int, t_size: float,
             _pixel_grid_width_step = 1.0, _pixel_grid_height_step = 1.0, _scale = 1.0,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         returns:
         1. Nx3 array of target image's pixels (normalized RGB)
@@ -271,75 +271,65 @@ class NeuralSurfaceReconstruction:
         """
         data, pose = self.images[index]
 
-        target_pixels = data.data.astype(np.float32)/255
-
-        del data.data
-        del data
-        gc.collect()
-
-        rot_mat = quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)   # 3x3 rot mat
-
+        # rot_mat = quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)   # 3x3 rot mat
+        rot_mat = torch.from_numpy(quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)).cuda()
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/sensor/models.h#L715
         # https://calib.io/blogs/knowledge-base/camera-models?srsltid=AfmBOoosTUXUe3QZqSrWoJXC9Yr04axC6Mvx7ru4xjo-yHMRf4H_erhx
 
         # initial point grid from image information
-        px, py = np.mgrid[-pose.width/2:pose.width/2:_pixel_grid_width_step,
-                          -pose.height/2:pose.height/2:_pixel_grid_height_step]
-        px, py = np.float32(px), np.float32(py)
+        x = torch.arange(-pose.width/2, pose.width/2, _pixel_grid_width_step).cuda()
+        y = torch.arange(-pose.height/2, pose.height/2, _pixel_grid_height_step).cuda()
+        z = torch.Tensor([1.0]).cuda()
+        p = torch.cartesian_prod(x, y, z)
 
-        ##### FOCAL LENGTH NORMALIZATION (f)
+        ##### FOCAL LENGTH NORMALIZATION (f) & alignment
         pose.f *= _scale
-        nx = (px.flatten()+0.5)/pose.f
-        ny = (py.flatten()+0.5)/pose.f
+        p[:, 0] = (p[:, 0]+0.5)/pose.f
+        p[:, 1] = (p[:, 1]+0.5)/pose.f
 
-        del px, py
+        del x,y,z
         gc.collect()
 
         ##### DISTORTION (k)
-        distortion = pose.k*(nx**2+ny**2)
+        distortion = 1 + pose.k*(p[:, 0]**2+p[:, 1]**2)
+        p[:, 0] *= distortion
+        p[:, 1] *= distortion
 
-        distorted_img_points = np.dstack([
-            nx*(1+distortion),
-            ny*(1+distortion),
-            np.full(nx.shape, 1.0, dtype=np.float32),  # z
-        ])[0]
-
-        del nx,ny,distortion
+        del distortion
         gc.collect()
 
-        ##### DISTORTION (k) & sampling query points
-        t = 1.0+t_size + np.arange(0, N_query_points, dtype=np.float32)*t_size
-        expand = lambda p: np.repeat(p[:, np.newaxis], N_query_points, axis=1)
+        ##### ROTATION (qvec) & sampling query points
+        t = 1.0+t_size + torch.arange(0, N_query_points, dtype=torch.float32).cuda()*t_size
+        # expand = lambda p: np.repeat(p[:, torch.newaxis], N_query_points, axis=1)
+        expand = lambda a: a[:, torch.newaxis].repeat(1, N_query_points, 1)
 
-        sto = t[np.newaxis, :, np.newaxis]*expand(
-            np.einsum("ij,nj->ni", rot_mat, distorted_img_points).astype(np.float32)  # rotation
+
+        sto = t[torch.newaxis, :, torch.newaxis]*expand(
+            # rotation
+            torch.einsum("ij,nj->ni", rot_mat, p)
         )  # 1xTx1 , NxTx3  =>  NxTx3
 
-        del t, distorted_img_points
+        del t  #, distorted_img_points
         gc.collect()
 
         # https://en.wikipedia.org/wiki/Spherical_coordinate_system
         # theta: inclination (0-180deg), 0deg = +Y; 180deg = -Y
         # phi: azimuth (0-360deg), 0deg = +X 0Z; 90deg = 0X +Z; 180deg = -X 0Z
-        sto_0 = sto[:, 0]
         
-        v = np.stack([
+        v = torch.stack([
             # THETA
-            np.arccos(sto_0[:,1] / np.linalg.norm(sto_0, axis=1)),  #*(180.0/np.pi)
+            torch.acos(sto[:,0,1] / torch.linalg.norm(sto[:,0], dim=1)),  #*(180.0/np.pi)
             # PHI
-            np.sign(sto_0[:,2])*np.arccos(sto_0[:,0] / np.linalg.norm(sto_0[:, [0,2]], axis=1)),   #*(180.0/np.pi)
-        ], axis=0)
-
-        del sto_0  #, theta, phi
-        gc.collect()
+            torch.sign(sto[:,0,2])*torch.acos(sto[:,0,0] / torch.linalg.norm(sto[:,0,[0,2]], dim=1)),   #*(180.0/np.pi)
+        ], dim=0)
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/geometry/rigid3.h#L72
-        st = sto+np.einsum("ij,j->i", rot_mat, -pose.tvec)
+        st = sto+torch.einsum("ij,j->i", rot_mat, -pose.tvec.cuda())
 
-        return (torch.from_numpy(target_pixels),
-                torch.from_numpy(st),
-                torch.from_numpy(v))
+        return (data.data,
+                st,
+                v)
 
     def train(self):
         loss = 0
