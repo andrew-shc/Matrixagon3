@@ -63,16 +63,8 @@ class VoxelSector:  # background / foreground
             self.grid_pos[2, 0, 0, :],
         ], dtype=np.float32)
 
-        self.center = np.array([
-            (self.grid_pos[0, :, 0, 0].max()+self.grid_pos[0, :, 0, 0].min())/2,
-            (self.grid_pos[1, 0, :, 0].max()+self.grid_pos[1, 0, :, 0].min())/2,
-            (self.grid_pos[2, 0, 0, :].max()+self.grid_pos[2, 0, 0, :].min())/2,
-        ], dtype=np.float32)
-        self.scale = np.array([
-            (self.grid_pos[0, :, 0, 0].max()-self.grid_pos[0, :, 0, 0].min())/2,
-            (self.grid_pos[1, 0, :, 0].max()-self.grid_pos[1, 0, :, 0].min())/2,
-            (self.grid_pos[2, 0, 0, :].max()-self.grid_pos[2, 0, 0, :].min())/2,
-        ], dtype=np.float32)
+        self.center = ((self.voxel_pos.max(axis=1)+self.voxel_pos.min(axis=1))/2)
+        self.scale = (self.voxel_pos.max(axis=1)-self.voxel_pos.min(axis=1))/2
 
 
 
@@ -214,7 +206,7 @@ class NeuralSurfaceReconstruction:
 
         self.model = NeuralSurfaceReconstructor(self.fg_V, self.bg_V, 64)
 
-    def query_pixel_sample_points(
+    def query_points_and_direction(
             self, index: int, *, N_query_points: int, t_size: float,
             _pixel_grid_width_step = 1.0, _pixel_grid_height_step = 1.0, _scale = 1.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -273,12 +265,20 @@ class NeuralSurfaceReconstruction:
         np.dstack([spx[:, 0], spy[:, 0], spz[:, 0]])
 
         sp = np.array([spx, spy, spz])  # 3xTxN
-        st = np.transpose(sp, (2, 1, 0))  # NxTx3
+        sto = np.transpose(sp, (2, 1, 0))  # NxTx3
+
+        # https://en.wikipedia.org/wiki/Spherical_coordinate_system
+        # theta: inclination (0-180deg), 0deg = +Y; 180deg = -Y
+        # phi: azimuth (0-360deg), 0deg = +X 0Z; 90deg = 0X +Z; 180deg = -X 0Z
+        sto_0 = sto[:, 0]
+        theta = np.arccos(sto_0[:,1] / np.linalg.norm(sto_0, axis=1))  #*(180.0/np.pi)
+        phi = np.sign(sto_0[:,2])*np.arccos(sto_0[:,0] / np.linalg.norm(sto_0[:, [0,2]], axis=1))  #*(180.0/np.pi)
+        v = np.stack([theta, phi], axis=1)
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/geometry/rigid3.h#L72
-        st = st+np.einsum("ij,j->i", rot_mat, -pose.tvec)
+        st = sto+np.einsum("ij,j->i", rot_mat, -pose.tvec)
 
-        return (target_pixels, st)
+        return (target_pixels, st, v)
     
     @staticmethod
     def S(x: np.ndarray, v_sdf: np.ndarray):
