@@ -53,7 +53,7 @@ class VoxelSector:  # background / foreground
         self.min_z = self.grid_pos[2].min()
         self.max_z = self.grid_pos[2].max()
 
-        self.feat = self.sdf.repeat(1, 3, 1, 1, 1)   # R,G,B
+        self.feat = self.sdf.repeat(1, 3, 1, 1, 1)   # B,C(R,G,B),X,Y,Z
         self.feat[:] = 0.5
 
         self.step_size = self.grid_pos[0][0][0][0]-self.grid_pos[0][1][0][0]        
@@ -114,7 +114,9 @@ class NeuralSurfaceReconstructor(nn.Module):
         self.fg_feat = nn.Parameter(self.fg_V.feat)
         self.bg_sdf = nn.Parameter(self.bg_V.sdf)
         self.bg_feat = nn.Parameter(self.bg_V.feat)
-        self.radiance_mlp_in = nn.Linear(in_features=3, out_features=radiance_mlp_size)
+
+        # R,G,B,theta,phi => R,G,B
+        self.radiance_mlp_in = nn.Linear(in_features=5, out_features=radiance_mlp_size)
         self.radiance_mlp_out = nn.Linear(in_features=radiance_mlp_size, out_features=3)
 
     @torch.no_grad
@@ -136,10 +138,12 @@ class NeuralSurfaceReconstructor(nn.Module):
 
     def S(self, x_i: torch.Tensor) -> torch.Tensor:
         """
-        x_i: a simple list of 3-D x-points in the current t_i
+        x_i: a simple list of 3-D x-points from current t_i
+        returns: SDF occupancy
         """
         is_f, is_b = self.sector(x_i)
 
+        # foreground
         norm_fx_i = ((x_i[is_f]-self.fg_V.center)/self.fg_V.scale).float()
         norm_fx_i = torch.flip(  # X Y Z -> Z Y X
             norm_fx_i[torch.newaxis, torch.newaxis, torch.newaxis],
@@ -150,6 +154,7 @@ class NeuralSurfaceReconstructor(nn.Module):
             mode="bilinear", padding_mode="border", align_corners=True
         ).flatten()
 
+        # background
         norm_bx_i = ((x_i[is_b]-self.bg_V.center)/self.bg_V.scale).float()
         norm_bx_i = torch.flip(  # X Y Z -> Z Y X
             norm_bx_i[torch.newaxis, torch.newaxis, torch.newaxis],
@@ -160,15 +165,61 @@ class NeuralSurfaceReconstructor(nn.Module):
             mode="bilinear", padding_mode="border", align_corners=True
         ).flatten()
 
-        sdf = torch.full(x_i.shape[:1], 1.0)
+        sdf = torch.full((x_i.shape[0],), 1.0)
         sdf[is_f] = f_sdf_i
         sdf[is_b] = b_sdf_i
 
         return sdf
 
 
-    def L_o(self, x_i: torch.Tensor, v: torch.Tensor):
-        pass
+    def L_o(self, x_i: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        x_i: ''
+        v: viewing direction in S^2 (theta, phi) for the corresponding x_i
+        returns: predicted RGB
+        """
+        
+        # -v
+        v[0] *= -1
+        v[1] = torch.pi-v[1]
+
+        is_f, is_b = self.sector(x_i)
+
+        # foreground
+        norm_fx_i = ((x_i[is_f]-self.fg_V.center)/self.fg_V.scale).float()
+        norm_fx_i = torch.flip(  # X Y Z -> Z Y X
+            norm_fx_i[torch.newaxis, torch.newaxis, torch.newaxis],
+            dims=[-1]
+        )
+        f_feat_i = F.grid_sample(
+            self.fg_V.feat, norm_fx_i,
+            mode="bilinear", padding_mode="border", align_corners=True
+        ).squeeze()  # CxN
+        f_embedding = torch.cat([f_feat_i, v[:, is_f]], axis=0)
+
+        # background
+        norm_bx_i = ((x_i[is_b]-self.bg_V.center)/self.bg_V.scale).float()
+        norm_bx_i = torch.flip(  # X Y Z -> Z Y X
+            norm_bx_i[torch.newaxis, torch.newaxis, torch.newaxis],
+            dims=[-1]
+        )
+        b_feat_i = F.grid_sample(
+            self.bg_V.feat, norm_bx_i,
+            mode="bilinear", padding_mode="border", align_corners=True
+        ).squeeze()  # CxN
+        b_embedding = torch.cat([b_feat_i, v[:, is_b]], axis=0)
+
+        # d for default
+        d_feat_i = torch.full((3,x_i.shape[0]), 0.5)
+        embedding = torch.cat([d_feat_i, v], axis=0)
+        embedding[:, is_f] = f_embedding
+        embedding[:, is_b] = b_embedding
+
+        radiance = F.relu(self.radiance_mlp_in(embedding.T))
+        radiance = self.radiance_mlp_out(radiance)
+        
+        return radiance
+
 
     def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
@@ -176,17 +227,17 @@ class NeuralSurfaceReconstructor(nn.Module):
         """
         N = 50
 
-        C_img = torch.Tensor()
-        T_i = torch.Tensor()  # start with 1
-        for i in range(N):
+        C_img = torch.full((x.shape[0],), 0.0)
+        T_i = torch.full((x.shape[0],), 1.0)
+        for i in range(N-1):
             α_i = torch.max(
                 0,
                 (
-                    torch.sigmoid(self.S(x[:, i  ]))-
-                    torch.sigmoid(self.S(x[:, i+1]))
-                )/torch.sigmoid(self.S(x[:, i]))
+                    F.sigmoid(self.S(x[:, i  ]))-
+                    F.sigmoid(self.S(x[:, i+1]))
+                )/F.sigmoid(self.S(x[:, i]))
             )
-            C_img += T_i*α_i*self.L_o(x[:, i], -v)
+            C_img += T_i*α_i*self.L_o(x[:, i], v)
             T_i *= (1-α_i)
 
 
@@ -273,26 +324,14 @@ class NeuralSurfaceReconstruction:
         sto_0 = sto[:, 0]
         theta = np.arccos(sto_0[:,1] / np.linalg.norm(sto_0, axis=1))  #*(180.0/np.pi)
         phi = np.sign(sto_0[:,2])*np.arccos(sto_0[:,0] / np.linalg.norm(sto_0[:, [0,2]], axis=1))  #*(180.0/np.pi)
-        v = np.stack([theta, phi], axis=1)
+        v = np.stack([theta, phi], axis=0)
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/geometry/rigid3.h#L72
         st = sto+np.einsum("ij,j->i", rot_mat, -pose.tvec)
 
-        return (target_pixels, st, v)
-    
-    @staticmethod
-    def S(x: np.ndarray, v_sdf: np.ndarray):
-        pass
-
-    @staticmethod
-    def L_o(x: np.ndarray, v: np.ndarray, v_feat: np.ndarray):
-        """
-        For sake of implementation: v must be represented in S^2 unit sphere (theta and phi)
-        """
-        pass
-
-    def render_color(self, query_points: np.ndarray):
-        pass
+        return (torch.from_numpy(target_pixels).float(),
+                torch.from_numpy(st).float(),
+                torch.from_numpy(v).float())
 
     def train(self):
         loss = 0
