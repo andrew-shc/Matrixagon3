@@ -29,7 +29,7 @@ class ImagePose:
     f: float
     k: float
     tvec: torch.Tensor
-    qvec: np.quaternion
+    rmat: torch.Tensor
 
 @dataclass
 class VoxelInfo:
@@ -85,9 +85,10 @@ class VoxelSector:  # background / foreground
 
 
 class TargetImageDataset(Dataset):
-    def __init__(self, source_path: Path, image_pose_file: Path, scale: float):
+    def __init__(self, source_path: Path, image_pose_file: Path, scale: float, device):
         self.source_path = source_path
         self.scale = scale
+        self.device = device
 
         with open(image_pose_file , "r") as fobj:
             self.image_pose = json.load(fobj)
@@ -103,36 +104,74 @@ class TargetImageDataset(Dataset):
         # print(index, image["file_name"])
 
         return ImageData(
-            data=torch.tensor(reduced/255, requires_grad=True).float()
+            data=torch.tensor(reduced/255, requires_grad=True).to(self.device).float()
         ), ImagePose(
             width=image["width"]*self.scale,
             height=image["height"]*self.scale,
             scale=self.scale,
             f=image["f"],
             k=image["k"],
-            tvec=torch.Tensor(image["tvec"]),
-            qvec=np.quaternion(*image["qvec"]),
+            tvec=torch.tensor(image["tvec"], device=self.device),
+            rmat=torch.from_numpy(
+                quaternion.as_rotation_matrix(
+                    np.quaternion(*image["qvec"])
+                ).T.astype(np.float32)
+            ).to(self.device),
         )
 
 
-
 @torch.no_grad
-def fg_bg_categorize(
+def sector_splitter(
     x_i: torch.Tensor, fg: VoxelInfo, bg: VoxelInfo
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
+    """ [BxN]x3 => (BxN, BxN)
+
+    # Nx3 -> BxNx3 = [:, i] -> [:, :, i]
     returns: (is foreground, is background) both are mutually exclusive
     """
-
-    ft = ((fg.min_x < x_i[:, 0]) & (x_i[:, 0] < fg.max_x) &
-          (fg.min_y < x_i[:, 1]) & (x_i[:, 1] < fg.max_y) &
-          (fg.min_z < x_i[:, 2]) & (x_i[:, 2] < fg.max_z))
+    
+    ft = ((fg.min_x < x_i[:,0]) & (x_i[:,0] < fg.max_x) &
+        (fg.min_y < x_i[:,1]) & (x_i[:,1] < fg.max_y) &
+        (fg.min_z < x_i[:,2]) & (x_i[:,2] < fg.max_z))
     # background filter should have a larger bbox
-    bt = ((bg.min_x < x_i[:, 0]) & (x_i[:, 0] < bg.max_x) &
-          (bg.min_y < x_i[:, 1]) & (x_i[:, 1] < bg.max_y) &
-          (bg.min_z < x_i[:, 2]) & (x_i[:, 2] < bg.max_z))
-
+    bt = ((bg.min_x < x_i[:,0]) & (x_i[:,0] < bg.max_x) &
+        (bg.min_y < x_i[:,1]) & (x_i[:,1] < bg.max_y) &
+        (bg.min_z < x_i[:,2]) & (x_i[:,2] < bg.max_z))
+        
     return (ft, bt & ~ft)
+
+def sector_splitter_old(
+    batched_x_i: torch.Tensor, fg: VoxelInfo, bg: VoxelInfo
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ BxNx3 => (fgx3, bgx3, BxN, BxN, B, B)
+
+    # Nx3 -> BxNx3 = [:, i] -> [:, :, i]
+    returns: (is foreground, is background) both are mutually exclusive
+    """
+    
+    x_i = batched_x_i.flatten(end_dim=1)
+
+    with torch.no_grad():
+        ft = ((fg.min_x < x_i[:,0]) & (x_i[:,0] < fg.max_x) &
+            (fg.min_y < x_i[:,1]) & (x_i[:,1] < fg.max_y) &
+            (fg.min_z < x_i[:,2]) & (x_i[:,2] < fg.max_z))
+        # background filter should have a larger bbox
+        bt = ((bg.min_x < x_i[:,0]) & (x_i[:,0] < bg.max_x) &
+            (bg.min_y < x_i[:,1]) & (x_i[:,1] < bg.max_y) &
+            (bg.min_z < x_i[:,2]) & (x_i[:,2] < bg.max_z))
+        
+
+    return (x_i[ft], x_i[bt], ft, bt & ~ft)
+
+
+def sector_merger(
+    fg: torch.Tensor, bg: torch.Tensor, ft: torch.Tensor, bt: torch.Tensor, 
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    """
+
+
+    return (x_i[ft], x_i[bt], ft, bt & ~ft)
 
 @torch.no_grad
 def grid_scaling(vx: VoxelSector, *, scale_factor, device) -> VoxelSector:
@@ -145,9 +184,9 @@ def grid_scaling(vx: VoxelSector, *, scale_factor, device) -> VoxelSector:
     new_grid_pos = torch.stack((newx, newy, newz))
 
     new_sdf = F.interpolate(vx.sdf, scale_factor=(scale_factor,)*3,
-                            mode="nearest")  # , align_corners=True
+                            mode="trilinear")  # , align_corners=True
     new_feat = F.interpolate(vx.feat, scale_factor=(scale_factor,)*3,
-                            mode="nearest")  # , align_corners=True
+                            mode="trilinear")  # , align_corners=True
     
     return VoxelSector(grid_pos=new_grid_pos, sdf=new_sdf, feat=new_feat)
 
@@ -179,44 +218,59 @@ class S(nn.Module):
     def forward(self, x_i: torch.Tensor) -> torch.Tensor:
         """
         x_i: a simple list of 3-D x-points from current t_i
-                Nx3 -> BxNx3
+                BxNx3
         returns: SDF occupancy
-                Nx1 -> BxNx1
+                BxNx(1)
         """
 
-        is_f, is_b = fg_bg_categorize(x_i, self.fg, self.bg)
+        p = x_i.flatten(end_dim=1)
+        is_f, is_b = sector_splitter(p, self.fg, self.bg)
+
+        # is_f, is_b = fg_bg_categorize(x_i, self.fg, self.bg)
+        # print(x_i)
+        # print(is_f)
+        # print(x_i[is_f])
+        # print(x_i.shape, x_i[is_f].shape)
 
         # foreground
         f_sdf_i = F.grid_sample(
             self.fg_sdf,
-            torch.flip(  # X Y Z -> Z Y X
+            torch.flip(  # [[X Y Z]] -> [[Z Y X]]
                 # normalize
-                (x_i[is_f]-self.fg.center)/self.fg.scale,
+                (p[is_f]-self.fg.center)/self.fg.scale,
                 dims=[-1]
             )[torch.newaxis, torch.newaxis, torch.newaxis],
+            # )[torch.newaxis, torch.newaxis],
             mode="bilinear",
             padding_mode="border",
             align_corners=True
-        ).flatten()
+        # ).flatten()
+        ).squeeze((0,1,2,3))   # [BxN]
 
         # background
         b_sdf_i = F.grid_sample(
             self.bg_sdf,
-            torch.flip(  # X Y Z -> Z Y X
+            torch.flip(  # [[X Y Z]] -> [[Z Y X]]
                 # normalize
-                (x_i[is_b]-self.bg.center)/self.bg.scale,
+                (p[is_b]-self.bg.center)/self.bg.scale,
                 dims=[-1]
             )[torch.newaxis, torch.newaxis, torch.newaxis],
+            # )[torch.newaxis, torch.newaxis],
             mode="bilinear",
             padding_mode="border",
             align_corners=True
-        ).flatten()
+        # ).flatten()
+        ).squeeze((0,1,2,3))   # [BxN]
 
-        sdf = torch.full((x_i.shape[0],), 1.0, device=self.device)
+        # sdf = torch.full((x_i.shape[0],x_i.shape[1]), 1.0, device=self.device)
+        # sdf[is_f] = f_sdf_i
+        # sdf[is_b] = b_sdf_i
+
+        sdf = torch.full((x_i.shape[0]*x_i.shape[1],), 1.0, device=self.device)
         sdf[is_f] = f_sdf_i
         sdf[is_b] = b_sdf_i
 
-        return sdf
+        return sdf.reshape((x_i.shape[0], x_i.shape[1]))
     
 
 
@@ -250,61 +304,74 @@ class L_o(nn.Module):
 
     def forward(self, x_i: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
-        x_i: ''
+        x_i: BxNx3
         v: viewing direction in S^2 (theta, phi) for the corresponding x_i
+            Bx2xN -> BxNx2 -> [BxN]x2
         returns: predicted RGB radiance @ i
-            Nx2 -> BxNx2
+           BxNx3
         """
         
         # -v
+        v = v.transpose(dim0=1, dim1=2).flatten(end_dim=1)
         v[0] = -v[0]
         v[1] = torch.pi-v[1]
 
-        is_f, is_b = fg_bg_categorize(x_i, self.fg, self.bg)
+        p = x_i.flatten(end_dim=1)
+        is_f, is_b = sector_splitter(p, self.fg, self.bg)
+
+        # is_f, is_b = fg_bg_categorize(x_i, self.fg, self.bg)
 
         # foreground
         f_feat_i = F.grid_sample(
             self.fg_feat,
-            torch.flip(  # X Y Z -> Z Y X
-                (x_i[is_f]-self.fg.center)/self.fg.scale,
+            torch.flip(  # [[X Y Z]] -> [[Z Y X]]
+                (p[is_f]-self.fg.center)/self.fg.scale,
                 dims=[-1]
             )[torch.newaxis, torch.newaxis, torch.newaxis],
+            # )[:, torch.newaxis, torch.newaxis],
             mode="bilinear",
             padding_mode="border",
             align_corners=True
-        ).squeeze((0,2,3))  # CxN
-        f_embedding = torch.cat([f_feat_i, v[:, is_f]], axis=0)
+        ).squeeze((0,2,3)).T  # Cx[BxN] -> [BxN]xC
+        # print(f_feat_i.shape, v.shape)
+        f_embedding = torch.cat([f_feat_i, v[is_f]], axis=1)
+        # f_embedding = torch.cat([f_feat_i, v[:,:,is_f]], axis=0)
+
 
         # background
         b_feat_i = F.grid_sample(
             self.bg_feat,
-            torch.flip(  # X Y Z -> Z Y X
-                (x_i[is_b]-self.bg.center)/self.bg.scale,
+            torch.flip(  # [[X Y Z]] -> [[Z Y X]]
+                (p[is_b]-self.bg.center)/self.bg.scale,
                 dims=[-1]
             )[torch.newaxis, torch.newaxis, torch.newaxis],
+            # )[:, torch.newaxis, torch.newaxis],
             mode="bilinear",
             padding_mode="border",
             align_corners=True
-        ).squeeze((0,2,3))  # CxN
-        b_embedding = torch.cat([b_feat_i, v[:, is_b]], axis=0)
+        ).squeeze((0,2,3)).T  # Cx[BxN]-> [BxN]xC
+        b_embedding = torch.cat([b_feat_i, v[is_b]], axis=1)
+        # b_embedding = torch.cat([b_feat_i, v[:,:,is_b]], axis=0)
 
         # d for default
-        d_feat_i = torch.full((3,x_i.shape[0]), 0.5, device=self.device)
-        embedding = torch.cat([d_feat_i, v], axis=0)
-        embedding[:, is_f] = f_embedding
-        embedding[:, is_b] = b_embedding
+        d_feat_i = torch.full((x_i.shape[0]*x_i.shape[1],3), 0.5, device=self.device)
+        # d_feat_i = torch.full((x_i.shape[0],3,x_i.shape[1]), 0.5, device=self.device)
+        embedding = torch.cat([d_feat_i, v], axis=1)
+        embedding[is_f] = f_embedding
+        embedding[is_b] = b_embedding
 
-        radiance = F.relu(self.radiance_mlp_in(embedding.T))
+        radiance = F.relu(self.radiance_mlp_in(embedding))
         radiance = self.radiance_mlp_out(radiance)
         
-        return radiance
+        return radiance.reshape((x_i.shape[0], x_i.shape[1], 3))
     
 
 class NSRLoss(nn.Module):
     """ Neural Surface Reconstruction Loss
     """
     def __init__(self,
-                 fg_V: VoxelSector, bg_V: VoxelSector, radiance_mlp_size: int,
+                 fg_V: VoxelSector, bg_V: VoxelSector,
+                 radiance_mlp_size: int, initial_sharpness: int,
                  w_lap: float, w_pprgb: float,
                  device: torch.device):
         super().__init__()
@@ -324,7 +391,7 @@ class NSRLoss(nn.Module):
             [[0.,0.,0.],[0.,1.,0.],[0.,0.,0.],],
         ]]], device=self.device)
 
-        self.sharpness = 5
+        self.sharpness = initial_sharpness
 
         self.w_lap = w_lap
         self.w_pprgb = w_pprgb
@@ -343,23 +410,31 @@ class NSRLoss(nn.Module):
             Nx3, NxTx3, Nx2 -> 1
                     v
             BxNx3,BxNxTx3,BxNx2 -> 1
+                torch.full will have additional x.shape prepended
+                [:, ...] -> [:, :, ...]
+                but, sum losses across batches (there should be no change)
         """
-        T = x.shape[1]  # number of points to sample for each ray direction
+        # T = x.shape[1]  # number of points to sample for each ray direction
+        T = x.shape[2]  # number of points to sample for each ray direction
 
         pprgb_loss = torch.tensor(0.0, device=self.device)
 
-        C_img = torch.full((x.shape[0],3), 0.0, device=self.device)
-        T_i = torch.full((x.shape[0],1), 1.0, device=self.device)
+        # C_img = torch.full((x.shape[0],3), 0.0, device=self.device)
+        # T_i = torch.full((x.shape[0],1), 1.0, device=self.device)
+        C_img = torch.full((x.shape[0],x.shape[1],3), 0.0, device=self.device)
+        T_i = torch.full((x.shape[0],x.shape[1],1), 1.0, device=self.device)
 
-        S_i =  self.s(x[:, 0  ])
+        # S_i =  self.s(x[:, 0  ])
+        S_i =  self.s(x[:,:, 0  ])
         S_i1 = None
         for i in range(T-1):
-            # S_i =  self.s(x[:, i  ])
             # S_i1 = self.s(x[:, i+1])
-            S_i1 = self.s(x[:, i+1])
-            L_o = self.lo(x[:, i], v)
+            # L_o = self.lo(x[:, i], v)
+            S_i1 = self.s(x[:,:, i+1])
+            L_o = self.lo(x[:,:, i], v)
 
-            α_i = ((self.σ(S_i)-self.σ(S_i1))/self.σ(S_i))[:, torch.newaxis]
+            # α_i = ((self.σ(S_i)-self.σ(S_i1))/self.σ(S_i))[:, torch.newaxis]
+            α_i = ((self.σ(S_i)-self.σ(S_i1))/self.σ(S_i))[:,:, torch.newaxis]
             α_i[α_i < 0.0] = 0.0
 
             C_img = C_img + T_i*α_i*L_o
@@ -383,7 +458,8 @@ class NeuralSurfaceReconstruction:
 
         self.images = TargetImageDataset(data / "raw_images",
                                          data / "preprocessed/image_pose.json",
-                                         scale=image_scale)
+                                         scale=image_scale,
+                                         device=self.device)
         self.fg_V = VoxelSector(
             grid_pos=torch.from_numpy(np.load(
                 data / "preprocessed/initial_v_sdf_fg.npy"
@@ -400,7 +476,10 @@ class NeuralSurfaceReconstruction:
         )
 
         self.model = NSRLoss(
-            self.fg_V, self.bg_V, 64, w_lap=10e-8, w_pprgb=0.01, device=self.device
+            self.fg_V, self.bg_V, 
+            radiance_mlp_size=128, initial_sharpness=1,
+            w_lap=10e-8, w_pprgb=0.01,
+            device=self.device
         )
 
     @torch.no_grad
@@ -417,7 +496,7 @@ class NeuralSurfaceReconstruction:
         data, pose = self.images[index]
 
         # rot_mat = quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)   # 3x3 rot mat
-        rot_mat = torch.from_numpy(quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)).to(self.device)
+        # rot_mat = torch.from_numpy(quaternion.as_rotation_matrix(pose.qvec).T.astype(np.float32)).to(self.device)
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/sensor/models.h#L715
         # https://calib.io/blogs/knowledge-base/camera-models?srsltid=AfmBOoosTUXUe3QZqSrWoJXC9Yr04axC6Mvx7ru4xjo-yHMRf4H_erhx
@@ -425,7 +504,7 @@ class NeuralSurfaceReconstruction:
         # initial point grid from image information
         x = torch.arange(-pose.width/2, pose.width/2, _pixel_grid_width_step, device=self.device)
         y = torch.arange(-pose.height/2, pose.height/2, _pixel_grid_height_step, device=self.device)
-        z = torch.Tensor([1.0], device=self.device)
+        z = torch.tensor([1.0], device=self.device)
         p = torch.cartesian_prod(x, y, z)
 
         ##### FOCAL LENGTH NORMALIZATION (f) & 0.5 alignment
@@ -452,7 +531,7 @@ class NeuralSurfaceReconstruction:
 
         sto = t[torch.newaxis, :, torch.newaxis]*expand(
             # rotation
-            torch.einsum("ij,nj->ni", rot_mat, p)
+            torch.einsum("ij,nj->ni", pose.rmat, p)
         )  # 1xTx1 , NxTx3  =>  NxTx3
 
         del t, p  #, distorted_img_points
@@ -470,9 +549,9 @@ class NeuralSurfaceReconstruction:
         ], dim=0)
 
         # https://github.com/colmap/colmap/blob/main/src/colmap/geometry/rigid3.h#L72
-        st = sto+torch.einsum("ij,j->i", rot_mat, -pose.tvec.to(self.device))
+        st = sto+torch.einsum("ij,j->i", pose.rmat, -pose.tvec)
 
-        return (data.data.to(self.device).permute(1,0,2).flatten(end_dim=1),
+        return (data.data.permute(1,0,2).flatten(end_dim=1),
                 st,
                 v)
     
